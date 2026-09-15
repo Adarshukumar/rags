@@ -1,0 +1,22 @@
+# docker-compose for the zai_re replay server (stdlib-only, no deps to install).
+#
+#   docker compose -f zai_re/docker-compose.yml up --build
+#   → demo UI: http://localhost:8801/   health: http://localhost:8801/health
+#
+# The build context is the repo root so the captured HAR can be copied in.
+services:
+  zai-replay:
+    build:
+      context: ..
+      dockerfile: zai_re/Dockerfile
+    image: zai-re:local
+    container_name: zai-re
+    ports:
+      - "8801:8801"
+    environment:
+      # 8x replay speed keeps the 125 s deep-search turn watchable in ~16 s
+      ZAI_SPEED: "8"
+    command: >
+      python3 -m zai_re.mock_server
+      --host 0.0.0.0 --port 8801 --speed 8 --chunk 96
+    restart: unless-stopped
