@@ -77,6 +77,7 @@ class ZaiClient:
         self.region = region
         self.device_id = device_id or f"uid_{uuid.uuid4().hex[:16]}"
         self.identity: Optional[Identity] = None
+        self._last_assistant_id: Optional[str] = None
         self.config: dict = {}
         self.models: list[dict] = []
 
@@ -177,8 +178,18 @@ class ZaiClient:
         """Returns (path, query, body) exactly as the browser shapes them."""
         now = time.time()
         local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
-        msg_id = user_message_id or getattr(self, "_last_user_message_id", None) \
-            or str(uuid.uuid4())
+        # Turn 1 reuses the id seeded by /chats/new (so the server does not
+        # duplicate it); later turns mint a NEW user id and point
+        # current_user_message_parent_id at the previous assistant message —
+        # which is precisely what the captured browser did.
+        if user_message_id:
+            msg_id = user_message_id
+        elif self._last_assistant_id is None:
+            msg_id = getattr(self, "_last_user_message_id", None) or str(uuid.uuid4())
+        else:
+            msg_id = str(uuid.uuid4())
+        if parent_id is None:
+            parent_id = self._last_assistant_id
         body = {
             "stream": True,
             "model": model,
@@ -280,6 +291,8 @@ class ZaiClient:
                 stream.close()
             except Exception:
                 pass
+        # the assistant id we sent becomes the parent of the next user message
+        self._last_assistant_id = body["id"]
         yield ("result", state)
 
 

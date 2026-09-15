@@ -191,3 +191,136 @@ python3 -m zai_re.mock_server --port 8801 --speed 8   # demo UI at /
    confirm whether the prefix (`turn0`, `turn1`, …) increments per agent turn.
 5. If a live session is ever run from a permitted network: capture one turn with `--header` logging to test
    whether the 32 fingerprint query params are validated or decorative.
+
+---
+
+# Session 2 — the workflow (streaming + server chat system) and offline verification
+
+**Date:** 2026-09-15 (later session) · **Branch:** `arena/01a0a5f2-rags`
+**Goal:** understand and reproduce *how the app works* — how the browser talks to the
+server chat system, how an answer is streamed, how tools fire, how continuity works —
+and make it actually run and answer requests.
+**Outcome:** `zai_re/{typo,corpus,chatstore,agent,server_chat,live,workflow_demo}.py`,
+`docs/zai-workflow-deep-dive.md`, 25 tests (all pass), byte-parity harness (still
+passing), a live preview chatbot on :8802, and `live.py` for the real endpoint.
+
+## S2.1 Egress recon — why the live call could not be made from here
+
+| Probe | Result | Meaning |
+|---|---|---|
+| `curl https://chat.z.ai/` | `000` (SSL) | target unreachable |
+| `openssl s_client -connect chat.z.ai:443` | `unexpected eof while reading` | dropped during handshake, not routing |
+| raw TCP `chat.z.ai:443` | connects | TCP is fine; the block is TLS-layer |
+| `openssl … api.github.com` | TLSv1.3 OK, `O = E2B` | **TLS-terminating allowlist proxy** — cert is the sandbox provider's |
+| `huggingface.co`, `hf.space` | `000` rc=35 | the HF proxy-miner space is unreachable |
+| `nodemaven.com`, `proxybros.com`, `proxymix.net`, `socks5proxies.com` | `000` rc=35 | **proxy providers are unreachable too** — a proxy cannot be used if you cannot reach the proxy |
+| `google.com`, `example.com`, `1.1.1.1` | `000` rc=35 | no general egress at all; GitHub + PyPI only |
+
+Consequences recorded honestly:
+* the live model was **not** called from this workspace; `zai_re.live` was written and
+  documented for a machine that can reach the service (the user's own), with the
+  captured URL/token passed via `--url` / `ZAI_TOKEN` (never written to disk, never committed);
+* the proxy-miner route was **not** wired in: it is unusable from here, and rotating
+  residential exits to present many "users" to a hosted service is mass multi-account
+  access against that service's terms. `captcha_verify_param` is forwarded, never forged.
+
+## S2.2 What the workflow actually is (findings)
+
+1. **State ownership.** The server owns order and identity; the client owns text.
+   Verified from the tree after turn 2: the node seeded by `/api/v1/chats/new` carries
+   `content`, the user node created by the *completion* path does **not**, and assistant
+   nodes never do. Continuity is therefore id stitching (`chat_id` +
+   `current_user_message_id` + `current_user_message_parent_id`), never history replay.
+2. **One user turn = several model invocations.** Deep search emitted four `usage`
+   frames inside one SSE stream (prompt tokens 1,921 → 3,678 → 5,565 → 7,625, each with
+   `cached_tokens`). The browser sees one stream; the backend made four calls.
+3. **`usage` can precede the final chunk** (turn 1: the trailing `"."`). Only `done`
+   terminates. Implemented as a test.
+4. **Tool arguments are fragmented** and the call id appears only in the first fragment.
+   Implemented + tested.
+5. **`tool_response` is the only place sources exist** — `[ref_id=…†title†url]` text,
+   which the client parses to build cards that the answer's `【turn0searchN】` markers link to.
+6. **Intent repair happens in the model's thinking**, not in the client: the captured
+   garbled prompt was decoded there. `zai_re/typo.py` now does that explicitly and
+   deterministically, and reproduces the model's exact decode.
+7. **Background tasks are off-turn**: `title_generation` renamed the chat after the
+   stream; `tags_generation` set entity/intent tags.
+
+## S2.3 Building the replica (design decisions)
+
+* `typo.py` — fuzzy token correction with three guards against over-correction: known
+  words pass through, valid inflections (`starships`) are not "fixed", and a lookahead
+  on the next token resolves ambiguity (`goad of` → `goals of`, not `good of`).
+  Output for the captured prompt matches the model's own decode verbatim.
+* `corpus.py` — parses the four `tool_response` frames into documents. **De-duplication
+  is by URL, not ref_id** (ref ids restart at `turn0search0` per search call — the same
+  quirk that made the live agent's `open` fail): 39 unique documents, not 15. Snippets
+  are chosen by a query-aware window because the captured text carries nav junk.
+* `chatstore.py` — the linked-list tree, the stub rule, and the two background workers.
+* `agent.py` — the phase machine; a **local, non-LLM** engine that composes extractively
+  from the corpus and keeps the frame vocabulary, ordering and tool-fragment behaviour
+  identical. It deliberately does not pretend to be a model (stated in `/health`, the UI
+  badge and the docs).
+* `server_chat.py` — the chatbot: real routes, SSE via chunked encoding, and the same
+  request-body contract the browser uses.
+* `live.py` — the real thing, for a network that can reach the service.
+
+## S2.4 Verification (executed)
+
+```
+python3 -m unittest discover -s tests -t .     → 25 tests OK
+   typo decoder      4 tests  (garbled prompt, clean prompt, inflection guard, spacing)
+   corpus            3 tests  (>=35 docs, relevant hits, ref_id render format)
+   agent             4 tests  (phase order, no tools for chat, args reassemble to JSON,
+                                usage-before-done)
+   chatstore         2 tests  (linked list + stub rule, background title/tags)
+   server e2e        2 tests  (full HTTP flow incl. tree stubbing; /health corpus count)
+python3 -m zai_re.verify                       → full parity across 3 captured turns
+python3 -m zai_re.workflow_demo                → narrated flow, all steps pass
+```
+
+Live multi-turn smoke test against the replica (`:8802`), via the same HTTP contract
+the browser uses:
+
+```
+chat created c8b971dc…                       (POST /api/v1/chats/new)
+turn 1  deep search whats next elonmkusk goad of towdy
+        phases {thinking 28, tool_call 10, tool_response 2, answer 32, other 1, done 1}
+        usage  {prompt 833, completion 1078, total 1911, cached 10}
+turn 2  and what about grok 5 ?              (parent = turn-1 assistant id)
+        phases {thinking 6, answer 26, other 1, done 1}
+tree after: title 'Search: Next Elon Musk Goals Of'
+        user(content=YES) → assistant(STUBBED) → user(STUBBED) → assistant(STUBBED)
+```
+
+That last line is the fidelity proof: it reproduces the captured tree pattern exactly.
+
+## S2.5 Bugs found in *my own* code while doing this (kept for honesty)
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| token-by-token rebuild | `heyhi` — spacing destroyed | rebuild preserving separators (`re.split` with capture) |
+| small vocabulary | `with` → `it` | embedded common-word list; unknown-word guard; ratio ≥ 0.75 |
+| no inflection guard | `starships` → `starship` | suffix check against vocab |
+| blind tie-break | `goad` → `good` | next-token lookahead + domain-word preference |
+| dedupe by ref_id | 39 docs collapsed to 15 | dedupe by URL |
+| `/chats/new` minted its own id | user node duplicated (3 nodes not 2) | thread the client's message id through; that is the real behaviour |
+| demo shadowed `args` | `AttributeError` at the end of the run | renamed the local variable |
+
+## S2.6 Runtime
+
+```
+python3 -m zai_re.server_chat --port 8802          # chatbot (live preview, this session)
+python3 -m zai_re.mock_server --port 8801 --speed 8 # capture replay (previous session)
+GET :8802/health → {"ok":true,"chats":…,"corpus_docs":39,"mode":"local-replica"}
+```
+
+## S2.7 Open questions carried forward
+
+1. Is `x-signature` validated? (mutate it in one live call and see.)
+2. Does any endpoint expose assistant text other than the stream? (None found in the capture.)
+3. How does the backend rebuild model context if the tree stores no text for later
+   turns — per-chat server session state, or does it persist text somewhere the tree
+   API does not expose?
+4. Does `turn0search…` prefix increment per agent turn (`turn1search0` in a second
+   search turn)? Only a second deep-search turn in one chat would show it.
